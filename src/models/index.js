@@ -146,19 +146,19 @@ const counterSchema = new Schema({ _id: { type: String }, value: { type: Number,
 
 function model(name, schema) {
   const collections = {
-    BillingUser: 'users',
-    BillingService: 'billing_services',
-    Invoice: 'billing_invoices',
-    Payment: 'billing_payments',
-    Receipt: 'billing_receipts',
-    InsuranceProvider: 'billing_providers',
-    InsuranceClaim: 'billing_claims',
-    Refund: 'billing_refunds',
-    AuditLog: 'auditlogs',
-    BillingSettings: 'billing_settings',
-    Counter: 'billing_counters'
+    BillingUser: 'users', // Keep shared
+    BillingService: 'billing_v2_services',
+    Invoice: 'billing_v2_invoices',
+    Payment: 'billing_v2_payments',
+    Receipt: 'billing_v2_receipts',
+    InsuranceProvider: 'billing_v2_providers',
+    InsuranceClaim: 'billing_v2_claims',
+    Refund: 'billing_v2_refunds',
+    AuditLog: 'auditlogs', // Keep shared
+    BillingSettings: 'billing_v2_settings',
+    Counter: 'billing_v2_counters'
   };
-  const collName = collections[name] || `billing_${name.toLowerCase()}`;
+  const collName = collections[name] || `billing_v2_${name.toLowerCase()}`;
   return mongoose.models[name] || mongoose.model(name, schema, collName);
 }
 
