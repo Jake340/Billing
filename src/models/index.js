@@ -3,23 +3,19 @@ const mongoose = require("mongoose");
 const { Schema } = mongoose;
 const options = { timestamps: true, versionKey: false };
 
+// Staff accounts live in the shared MediLink `users` collection, which every subsystem uses.
+// Billing declares only the fields it reads or writes and never builds indexes on it.
 const userSchema = new Schema({
-  username: { type: String, required: true, unique: true, trim: true, lowercase: true },
-  email: { type: String, required: true, unique: true, trim: true, lowercase: true },
+  employeeId: { type: String, trim: true },
+  firstName: { type: String, trim: true, default: "" },
+  lastName: { type: String, trim: true, default: "" },
+  username: { type: String, trim: true, lowercase: true },
+  email: { type: String, required: true, trim: true, lowercase: true },
   passwordHash: { type: String, required: true, select: false },
-  role: { type: String, enum: ["billing_admin", "billing_officer", "cashier", "billing_auditor"], required: true },
-  active: { type: Boolean, default: true }
-}, options);
-
-const accountSchema = new Schema({
-  patientId: { type: String, required: true, trim: true, unique: true, index: true },
-  patientName: { type: String, required: true, trim: true },
-  billingAccountNumber: { type: String, required: true, unique: true, trim: true },
-  contact: { type: String, trim: true, default: "" },
-  billingAddress: { type: String, trim: true, default: "" },
-  insuranceProviderId: { type: Schema.Types.ObjectId, ref: "InsuranceProvider", default: null },
-  insuranceReference: { type: String, trim: true, default: "" }
-}, options);
+  role: { type: String, required: true },
+  subsystems: { type: [String], default: undefined },
+  status: { type: String, default: "Active" }
+}, { timestamps: true, autoIndex: false });
 
 const serviceSchema = new Schema({
   code: { type: String, required: true, trim: true, uppercase: true, unique: true },
@@ -32,9 +28,10 @@ const serviceSchema = new Schema({
 
 const invoiceSchema = new Schema({
   invoiceNumber: { type: String, unique: true, sparse: true, index: true },
-  patientAccountId: { type: Schema.Types.ObjectId, ref: "PatientBillingAccount", required: true, index: true },
   patientId: { type: String, required: true, index: true },
   patientName: { type: String, required: true },
+  department: { type: String, trim: true, default: "", index: true },
+  sourceReference: { type: String, trim: true, default: "" },
   dueDate: { type: Date, required: true, index: true },
   issuedAt: { type: Date, default: null },
   status: { type: String, enum: ["draft", "issued", "partially_paid", "paid", "overdue", "cancelled"], default: "draft", index: true },
@@ -66,6 +63,7 @@ const paymentSchema = new Schema({
   invoiceNumber: { type: String, required: true, index: true },
   patientId: { type: String, required: true, index: true },
   patientName: { type: String, required: true },
+  department: { type: String, default: "" },
   amountCents: { type: Number, required: true, min: 1 },
   method: { type: String, enum: ["cash", "bank_transfer", "card_terminal", "e_wallet", "insurance", "other"], required: true },
   transactionReference: { type: String, trim: true, default: "" },
@@ -83,6 +81,7 @@ const receiptSchema = new Schema({
   invoiceNumber: { type: String, required: true },
   patientId: { type: String, required: true },
   patientName: { type: String, required: true },
+  department: { type: String, default: "" },
   amountCents: { type: Number, required: true },
   method: { type: String, required: true },
   transactionReference: { type: String, default: "" },
@@ -121,15 +120,17 @@ const refundSchema = new Schema({
   approvedAt: { type: Date, default: null }
 }, options);
 
+// Activity goes to the shared MediLink `auditlogs` collection, in the shape the other
+// subsystems already use. Build entries with auditEntry() from utils/access.
 const auditSchema = new Schema({
-  userId: { type: Schema.Types.ObjectId, ref: "BillingUser", default: null },
-  username: { type: String, default: "system" },
-  action: { type: String, required: true, index: true },
-  recordType: { type: String, default: "" },
-  recordId: { type: String, default: "" },
-  details: { type: Schema.Types.Mixed, default: {} },
+  user: { type: Schema.Types.ObjectId, default: null },
+  userName: { type: String, default: "Unknown user" },
+  role: { type: String, default: "—" },
+  action: { type: String, required: true },
+  module: { type: String, default: "Billing" },
+  details: { type: String, default: "" },
   ip: { type: String, default: "" }
-}, { ...options, strict: true });
+}, { timestamps: true, autoIndex: false });
 
 const settingsSchema = new Schema({
   _id: { type: String, default: "billing" },
@@ -145,8 +146,7 @@ const counterSchema = new Schema({ _id: { type: String }, value: { type: Number,
 
 function model(name, schema) {
   const collections = {
-    BillingUser: 'billing_users',
-    PatientBillingAccount: 'billing_accounts',
+    BillingUser: 'users',
     BillingService: 'billing_services',
     Invoice: 'billing_invoices',
     Payment: 'billing_payments',
@@ -154,7 +154,7 @@ function model(name, schema) {
     InsuranceProvider: 'billing_providers',
     InsuranceClaim: 'billing_claims',
     Refund: 'billing_refunds',
-    AuditLog: 'billing_audit_logs',
+    AuditLog: 'auditlogs',
     BillingSettings: 'billing_settings',
     Counter: 'billing_counters'
   };
@@ -162,9 +162,29 @@ function model(name, schema) {
   return mongoose.models[name] || mongoose.model(name, schema, collName);
 }
 
+// Collections are only created in the shared database when they are first needed.
+// Indexes (which also create the collection) are built on demand through these helpers.
+const indexed = new Map();
+function ensureIndexes(Model) {
+  if (!indexed.has(Model.modelName)) {
+    indexed.set(Model.modelName, Model.createIndexes().catch((error) => {
+      indexed.delete(Model.modelName);
+      throw error;
+    }));
+  }
+  return indexed.get(Model.modelName);
+}
+
+// The billing-owned collections every billing and payment flow depends on.
+// The shared `users` and `auditlogs` collections are left exactly as they are.
+function ensureCoreIndexes() {
+  return Promise.all(["Invoice", "Payment", "Receipt"].map((name) => ensureIndexes(mongoose.model(name))));
+}
+
 module.exports = {
+  ensureIndexes,
+  ensureCoreIndexes,
   BillingUser: model("BillingUser", userSchema),
-  PatientBillingAccount: model("PatientBillingAccount", accountSchema),
   BillingService: model("BillingService", serviceSchema),
   Invoice: model("Invoice", invoiceSchema),
   Payment: model("Payment", paymentSchema),

@@ -1,5 +1,6 @@
 const path = require("node:path");
 const express = require("express");
+const mongoose = require("mongoose");
 const session = require("express-session");
 const MongoStore = require("connect-mongo");
 const helmet = require("helmet");
@@ -11,7 +12,7 @@ const { getDatabaseName } = require("./config/database");
 function createApp() {
   const app = express();
   if (process.env.TRUST_PROXY === "1") app.set("trust proxy", 1);
-  app.use(helmet({ contentSecurityPolicy: { directives: { scriptSrc: ["'self'"], styleSrc: ["'self'"], imgSrc: ["'self'", "data:"] } } }));
+  app.use(helmet({ contentSecurityPolicy: { directives: { scriptSrc: ["'self'"], styleSrc: ["'self'", "https://fonts.googleapis.com"], fontSrc: ["'self'", "https://fonts.gstatic.com"], imgSrc: ["'self'", "data:"] } } }));
   app.use(express.json({ limit: "100kb" }));
   app.use(session({
     name: "medilink.sid",
@@ -19,8 +20,9 @@ function createApp() {
     resave: false,
     saveUninitialized: false,
     store: MongoStore.create({
-      mongoUrl: process.env.MONGODB_URI,
-      mongoOptions: { dbName: getDatabaseName() },
+      // Reuse the connection opened by connectDatabase() instead of opening a second one.
+      client: mongoose.connection.getClient(),
+      dbName: getDatabaseName(),
       collectionName: "billing_sessions",
       ttl: 60 * 60 * 8
     }),

@@ -2,21 +2,16 @@ const express = require("express");
 const mongoose = require("mongoose");
 const { z } = require("zod");
 const {
-  BillingUser, PatientBillingAccount, BillingService, Invoice, Payment, Receipt,
-  InsuranceProvider, InsuranceClaim, Refund, AuditLog, BillingSettings
+  BillingService, Invoice, Payment, Receipt,
+  InsuranceProvider, InsuranceClaim, Refund, AuditLog, BillingSettings, ensureIndexes
 } = require("../models");
 const { ROLES, requireAuth, allowRoles } = require("../middleware/auth");
 const { isValidCents, calculateInvoice, paymentStatus, agingBucket, manilaStartOfDay, manilaStartOfMonth } = require("../utils/financials");
 const { nextNumber } = require("../utils/sequence");
+const { auditEntry } = require("../utils/access");
+const { listDepartments, findDepartment, listPatients, findPatient, listSourceRecords, toPatient } = require("../services/subsystems");
 
 const router = express.Router();
-const accountInput = z.object({
-  patientId: z.string().trim().min(1).max(80),
-  patientName: z.string().trim().min(1).max(160),
-  billingAccountNumber: z.string().trim().min(1).max(80),
-  contact: z.string().trim().max(160).optional(),
-  billingAddress: z.string().trim().max(500).optional()
-});
 const serviceInput = z.object({
   code: z.string().trim().min(1).max(40),
   name: z.string().trim().min(1).max(160),
@@ -25,21 +20,20 @@ const serviceInput = z.object({
   unitPriceCents: z.number().int().nonnegative().safe()
 });
 const invoiceInput = z.object({
-  patientAccountId: z.string().min(1),
+  patientId: z.string().trim().min(1).max(80),
   items: z.array(z.object({ serviceId: z.string().min(1), quantity: z.number().int().min(1).max(10000) })).min(1).max(100),
   notes: z.string().trim().max(2000).optional()
 });
+const billInput = z.object({
+  department: z.number().int().positive(),
+  patientId: z.string().trim().min(1).max(80),
+  amountCents: z.number().int().positive().safe(),
+  description: z.string().trim().max(300).optional(),
+  sourceReference: z.string().trim().max(80).optional()
+});
 
 function audit(req, action, recordType, recordId, details = {}) {
-  return AuditLog.create({
-    userId: req.session.user.id,
-    username: req.session.user.username,
-    action,
-    recordType,
-    recordId: String(recordId || ""),
-    details,
-    ip: req.ip
-  });
+  return AuditLog.create(auditEntry(req.session.user, action, { recordType, recordId, details, ip: req.ip }));
 }
 
 function paginated(query) {
@@ -77,18 +71,83 @@ router.get("/dashboard", allowRoles(ROLES.readBilling), async (req, res) => {
   });
 });
 
-router.get("/accounts", allowRoles(ROLES.readBilling), async (req, res) => {
-  const { page, limit, skip } = paginated(req.query);
-  const search = String(req.query.search || "").slice(0, 120);
-  const filter = search ? { $or: ["patientId", "patientName", "billingAccountNumber"].map((key) => ({ [key]: { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), $options: "i" } })) } : {};
-  const [items, total] = await Promise.all([PatientBillingAccount.find(filter).sort({ patientName: 1 }).skip(skip).limit(limit).lean(), PatientBillingAccount.countDocuments(filter)]);
-  res.json({ items, page, limit, total });
+// The signed-in cashier's own day: what they collected, and what is waiting to be paid.
+router.get("/cashier/dashboard", allowRoles(ROLES.cashier), async (req, res) => {
+  const me = new mongoose.Types.ObjectId(req.session.user.id);
+  const mineToday = { recordedBy: me, createdAt: { $gte: manilaStartOfDay() } };
+  const waitingFilter = { status: { $in: ["issued", "partially_paid", "overdue"] }, balanceCents: { $gt: 0 } };
+  const [today, methods, waiting, waitingBills, payments] = await Promise.all([
+    Payment.aggregate([{ $match: mineToday }, { $group: { _id: null, cents: { $sum: "$amountCents" }, count: { $sum: 1 } } }]),
+    Payment.aggregate([{ $match: mineToday }, { $group: { _id: "$method", cents: { $sum: "$amountCents" }, count: { $sum: 1 } } }, { $sort: { cents: -1 } }]),
+    Invoice.aggregate([{ $match: waitingFilter }, { $group: { _id: null, cents: { $sum: "$balanceCents" }, count: { $sum: 1 } } }]),
+    Invoice.find(waitingFilter).sort({ createdAt: 1 }).limit(8).lean(),
+    Payment.find({ recordedBy: me }).sort({ createdAt: -1 }).limit(10).lean()
+  ]);
+  const receipts = await Receipt.find({ paymentId: { $in: payments.map((payment) => payment._id) } }).select("paymentId receiptNumber").lean();
+  const receiptByPayment = new Map(receipts.map((receipt) => [String(receipt.paymentId), receipt]));
+  res.json({
+    totals: {
+      collectedTodayCents: today[0]?.cents || 0, receiptsToday: today[0]?.count || 0,
+      waitingBills: waiting[0]?.count || 0, waitingCents: waiting[0]?.cents || 0
+    },
+    methodsToday: methods.map((row) => ({ method: row._id, cents: row.cents, count: row.count })),
+    waitingBills,
+    recentPayments: payments.map((payment) => ({
+      ...payment, receiptId: receiptByPayment.get(String(payment._id))?._id || null,
+      receiptNumber: receiptByPayment.get(String(payment._id))?.receiptNumber || ""
+    }))
+  });
 });
 
-router.post("/accounts", allowRoles(ROLES.billing), async (req, res) => {
-  const account = await PatientBillingAccount.create(accountInput.parse(req.body));
-  await audit(req, "account.created", "PatientBillingAccount", account.id);
-  res.status(201).json(account);
+// Every patient who has paid something, with what they paid and what they still owe.
+router.get("/patient-history", allowRoles(ROLES.readBilling), async (req, res) => {
+  const search = String(req.query.search || "").trim().slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = { status: { $nin: ["draft", "cancelled"] } };
+  if (search) match.$or = [{ patientName: { $regex: search, $options: "i" } }, { patientId: { $regex: search, $options: "i" } }];
+  const [bills, payments] = await Promise.all([
+    Invoice.aggregate([
+      { $match: match },
+      { $sort: { createdAt: 1 } },
+      { $group: {
+        _id: "$patientId", patientName: { $last: "$patientName" }, bills: { $sum: 1 },
+        billsPaid: { $sum: { $cond: [{ $eq: ["$status", "paid"] }, 1, 0] } },
+        billedCents: { $sum: "$totalCents" }, paidCents: { $sum: "$paidCents" }, balanceCents: { $sum: "$balanceCents" }
+      } },
+      { $match: { paidCents: { $gt: 0 } } }
+    ]),
+    Payment.aggregate([{ $group: { _id: "$patientId", payments: { $sum: 1 }, lastPaymentAt: { $max: "$createdAt" } } }])
+  ]);
+  const paymentsByPatient = new Map(payments.map((row) => [row._id, row]));
+  const items = bills.map((row) => ({
+    patientId: row._id, patientName: row.patientName, bills: row.bills, billsPaid: row.billsPaid,
+    billedCents: row.billedCents, paidCents: row.paidCents, balanceCents: row.balanceCents,
+    payments: paymentsByPatient.get(row._id)?.payments || 0, lastPaymentAt: paymentsByPatient.get(row._id)?.lastPaymentAt || null
+  })).sort((a, b) => new Date(b.lastPaymentAt || 0) - new Date(a.lastPaymentAt || 0));
+  res.json({ items });
+});
+
+// One patient's bills and payments, with the receipt for each payment.
+router.get("/patient-history/:patientId", allowRoles(ROLES.readBilling), async (req, res) => {
+  const patientId = String(req.params.patientId).slice(0, 80);
+  const [bills, payments] = await Promise.all([
+    Invoice.find({ patientId, status: { $nin: ["draft", "cancelled"] } }).sort({ createdAt: -1 }).limit(200).lean(),
+    Payment.find({ patientId }).sort({ createdAt: -1 }).limit(500).lean()
+  ]);
+  if (!bills.length && !payments.length) return res.status(404).json({ error: "This patient has no billing history." });
+  const receipts = await Receipt.find({ paymentId: { $in: payments.map((payment) => payment._id) } }).select("paymentId receiptNumber").lean();
+  const receiptByPayment = new Map(receipts.map((receipt) => [String(receipt.paymentId), receipt]));
+  res.json({
+    patientId, patientName: bills[0]?.patientName || payments[0]?.patientName || "",
+    totals: {
+      billedCents: bills.reduce((sum, bill) => sum + bill.totalCents, 0), paidCents: bills.reduce((sum, bill) => sum + bill.paidCents, 0),
+      balanceCents: bills.reduce((sum, bill) => sum + bill.balanceCents, 0)
+    },
+    bills,
+    payments: payments.map((payment) => ({
+      ...payment, receiptId: receiptByPayment.get(String(payment._id))?._id || null,
+      receiptNumber: receiptByPayment.get(String(payment._id))?.receiptNumber || ""
+    }))
+  });
 });
 
 router.get("/services", allowRoles(ROLES.readBilling), async (req, res) => {
@@ -98,6 +157,7 @@ router.get("/services", allowRoles(ROLES.readBilling), async (req, res) => {
 });
 
 router.post("/services", allowRoles(ROLES.admin), async (req, res) => {
+  await ensureIndexes(BillingService);
   const service = await BillingService.create(serviceInput.parse(req.body));
   await audit(req, "service.created", "BillingService", service.id);
   res.status(201).json(service);
@@ -125,9 +185,9 @@ router.get("/invoices", allowRoles(ROLES.readBilling), async (req, res) => {
 
 router.post("/invoices", allowRoles(ROLES.billing), async (req, res) => {
   const input = invoiceInput.parse(req.body);
-  if (!mongoose.isValidObjectId(input.patientAccountId)) return res.status(400).json({ error: "Invalid patient account." });
-  const account = await PatientBillingAccount.findById(input.patientAccountId);
-  if (!account) return res.status(404).json({ error: "Patient billing account not found." });
+  // Patients are never created here; they come from the Patient Registration subsystem.
+  const patient = await findPatient(input.patientId);
+  if (!patient) return res.status(400).json({ error: "Patient was not found in the MediLink patient registry." });
   const services = await BillingService.find({ _id: { $in: input.items.map((item) => item.serviceId) }, active: true });
   const serviceMap = new Map(services.map((service) => [service.id, service]));
   const items = input.items.map(({ serviceId, quantity }) => {
@@ -141,7 +201,7 @@ router.post("/invoices", allowRoles(ROLES.billing), async (req, res) => {
   const totals = calculateInvoice(items, settings?.taxBasisPoints || 0);
   const dueDate = new Date(Date.now() + (settings?.defaultDueDays ?? 30) * 86400000);
   const invoice = await Invoice.create({
-    patientAccountId: account._id, patientId: account.patientId, patientName: account.patientName,
+    patientId: patient.patientId, patientName: toPatient(patient).patientName,
     dueDate, items, ...totals, balanceCents: totals.totalCents, notes: input.notes || "",
     createdBy: req.session.user.id
   });
@@ -149,7 +209,56 @@ router.post("/invoices", allowRoles(ROLES.billing), async (req, res) => {
   res.status(201).json(invoice);
 });
 
-router.post("/invoices/:id/issue", allowRoles(ROLES.billing), async (req, res) => {
+// Department choices are the other subsystems registered in the MediLink portal.
+router.get("/departments", allowRoles(ROLES.readBilling), async (req, res) => {
+  res.json({ items: await listDepartments() });
+});
+
+// Patients come from the shared registry owned by Patient Registration.
+router.get("/patients", allowRoles(ROLES.readBilling), async (req, res) => {
+  res.json({ items: await listPatients(req.query.search) });
+});
+
+// Records the chosen department holds for the chosen patient (lab requests, admissions, ...).
+router.get("/source-records", allowRoles(ROLES.readBilling), async (req, res) => {
+  const departmentId = Number(req.query.department);
+  const patient = await findPatient(typeof req.query.patientId === "string" ? req.query.patientId : "");
+  if (!Number.isInteger(departmentId) || !patient) return res.status(400).json({ error: "Choose a department and a registered patient." });
+  const records = await listSourceRecords(departmentId, patient);
+  const references = records.map((record) => record.reference).filter(Boolean);
+  const billed = references.length
+    ? new Set(await Invoice.distinct("sourceReference", { sourceReference: { $in: references }, status: { $ne: "cancelled" } }))
+    : new Set();
+  res.json({ items: records.map((record) => ({ ...record, billed: billed.has(record.reference) })) });
+});
+
+// A department bill is issued immediately so it appears in Payments right away.
+router.post("/bills", allowRoles(ROLES.billing), async (req, res) => {
+  const input = billInput.parse(req.body);
+  if (!isValidCents(input.amountCents)) return res.status(400).json({ error: "Bill amount must be greater than zero." });
+  const [department, patient] = await Promise.all([findDepartment(input.department), findPatient(input.patientId)]);
+  if (!department) return res.status(400).json({ error: "Choose a department from the list." });
+  if (!patient) return res.status(400).json({ error: "Patient was not found in the MediLink patient registry." });
+  const items = [{
+    serviceId: null, serviceCode: `SUB-${department.id}`, description: input.description || `${department.name} charges`,
+    category: department.name, quantity: 1, unitPriceCents: input.amountCents, lineTotalCents: input.amountCents
+  }];
+  const settings = await BillingSettings.findById("billing").lean();
+  const totals = calculateInvoice(items, settings?.taxBasisPoints || 0);
+  const now = new Date();
+  const invoice = await Invoice.create({
+    invoiceNumber: await nextNumber("invoice", "INV"),
+    patientId: patient.patientId, patientName: toPatient(patient).patientName, department: department.name,
+    sourceReference: input.sourceReference || "",
+    dueDate: new Date(now.getTime() + (settings?.defaultDueDays ?? 30) * 86400000), issuedAt: now, status: "issued",
+    items, ...totals, balanceCents: totals.totalCents, notes: input.description || "",
+    createdBy: req.session.user.id
+  });
+  await audit(req, "bill.created", "Bill", invoice.invoiceNumber, { department: department.name, patient: invoice.patientId, totalCents: invoice.totalCents });
+  res.status(201).json(invoice);
+});
+
+router.post("/invoices/:id/issue",allowRoles(ROLES.billing), async (req, res) => {
   const session = await mongoose.startSession();
   let invoice;
   try {
@@ -160,15 +269,7 @@ router.post("/invoices/:id/issue", allowRoles(ROLES.billing), async (req, res) =
       invoice.status = "issued";
       invoice.issuedAt = new Date();
       await invoice.save({ session });
-      await AuditLog.create([{
-        userId: req.session.user.id,
-        username: req.session.user.username,
-        action: "invoice.issued",
-        recordType: "Invoice",
-        recordId: invoice.id,
-        details: { invoiceNumber: invoice.invoiceNumber },
-        ip: req.ip
-      }], { session });
+      await AuditLog.create([auditEntry(req.session.user, "invoice.issued", { recordType: "Invoice", recordId: invoice.invoiceNumber, ip: req.ip })], { session });
     });
   } finally {
     await session.endSession();
@@ -220,7 +321,8 @@ router.post("/payments", allowRoles(ROLES.cashier), async (req, res) => {
       const receiptNumber = await nextNumber("receipt", "RCP", session);
       const [payment] = await Payment.create([{
         paymentReference, idempotencyKey, invoiceId: invoice._id, invoiceNumber: invoice.invoiceNumber,
-        patientId: invoice.patientId, patientName: invoice.patientName, amountCents: input.amountCents,
+        patientId: invoice.patientId, patientName: invoice.patientName, department: invoice.department || "",
+        amountCents: input.amountCents,
         method: input.method, transactionReference: input.transactionReference || "", notes: input.notes || "",
         recordedBy: req.session.user.id
       }], { session });
@@ -234,13 +336,13 @@ router.post("/payments", allowRoles(ROLES.cashier), async (req, res) => {
         hospitalAddress: settings?.hospitalAddress || process.env.HOSPITAL_ADDRESS || "",
         hospitalContact: settings?.hospitalContact || process.env.HOSPITAL_CONTACT || "",
         invoiceNumber: invoice.invoiceNumber, patientId: invoice.patientId, patientName: invoice.patientName,
-        amountCents: payment.amountCents, method: payment.method, transactionReference: payment.transactionReference,
+        department: invoice.department || "", amountCents: payment.amountCents, method: payment.method, transactionReference: payment.transactionReference,
         balanceAfterCents: invoice.balanceCents, issuedBy: req.session.user.id
       }], { session });
-      await AuditLog.create([{
-        userId: req.session.user.id, username: req.session.user.username, action: "payment.recorded",
-        recordType: "Payment", recordId: payment.id, details: { amountCents: input.amountCents, invoiceNumber: invoice.invoiceNumber }, ip: req.ip
-      }], { session });
+      await AuditLog.create([auditEntry(req.session.user, "payment.recorded", {
+        recordType: "Payment", recordId: paymentReference,
+        details: { amountCents: input.amountCents, bill: invoice.invoiceNumber, receipt: receiptNumber, patient: invoice.patientId }, ip: req.ip
+      })], { session });
       result = { payment, receipt };
     });
   } finally {
@@ -271,6 +373,7 @@ router.get("/insurance/providers", allowRoles(ROLES.readBilling), async (req, re
 
 router.post("/insurance/providers", allowRoles(ROLES.admin), async (req, res) => {
   const input = z.object({ code: z.string().trim().min(1).max(40), name: z.string().trim().min(1).max(160), contact: z.string().trim().max(160).optional() }).parse(req.body);
+  await ensureIndexes(InsuranceProvider);
   const provider = await InsuranceProvider.create(input);
   await audit(req, "insurance.provider_created", "InsuranceProvider", provider.id);
   res.status(201).json(provider);
@@ -306,6 +409,7 @@ router.post("/refunds", allowRoles(ROLES.admin), async (req, res) => {
   if (!payment || input.amountCents > payment.amountCents) return res.status(400).json({ error: "Refund amount exceeds the original payment." });
   const already = await Refund.aggregate([{ $match: { paymentId: payment._id, status: { $in: ["pending", "approved"] } } }, { $group: { _id: null, cents: { $sum: "$amountCents" } } }]);
   if ((already[0]?.cents || 0) + input.amountCents > payment.amountCents) return res.status(409).json({ error: "Refund amount exceeds the unrefunded payment amount." });
+  await ensureIndexes(Refund);
   const refund = await Refund.create({ refundNumber: await nextNumber("refund", "REF"), paymentId: payment._id, invoiceId: payment.invoiceId, amountCents: input.amountCents, reason: input.reason, requestedBy: req.session.user.id });
   await audit(req, "refund.requested", "Refund", refund.id, { amountCents: refund.amountCents });
   res.status(201).json(refund);
@@ -332,7 +436,7 @@ router.post("/refunds/:id/approve", allowRoles(ROLES.admin), async (req, res) =>
       refund.approvedBy = req.session.user.id;
       refund.approvedAt = new Date();
       await refund.save({ session });
-      await AuditLog.create([{ userId: req.session.user.id, username: req.session.user.username, action: "refund.approved", recordType: "Refund", recordId: refund.id, details: { amountCents: refund.amountCents }, ip: req.ip }], { session });
+      await AuditLog.create([auditEntry(req.session.user, "refund.approved", { recordType: "Refund", recordId: refund.refundNumber, details: { amountCents: refund.amountCents }, ip: req.ip })], { session });
     });
   } finally {
     await session.endSession();
@@ -364,7 +468,13 @@ router.get("/reports/payments.csv", allowRoles(ROLES.readBilling), async (req, r
 });
 
 router.get("/audit-logs", allowRoles(ROLES.adminOrAuditor), async (req, res) => {
-  res.json({ items: await AuditLog.find().sort({ createdAt: -1 }).limit(500).lean() });
+  // The shared collection holds every subsystem's activity; older rows use slightly different field names.
+  const filter = req.query.module === "billing" ? { module: "Billing" } : {};
+  const rows = await AuditLog.collection.find(filter).sort({ createdAt: -1 }).limit(500).toArray();
+  res.json({ items: rows.map((row) => ({
+    _id: row._id, createdAt: row.createdAt, userName: row.userName || row.username || "Unknown user", role: row.role || "—",
+    action: row.action || "", module: row.module || "", details: String(row.details ?? row.Details ?? ""), ip: String(row.ip ?? row.IP ?? "")
+  })) });
 });
 
 router.get("/settings", allowRoles(ROLES.readBilling), async (req, res) => {

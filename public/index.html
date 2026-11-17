@@ -3,8 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#111418">
+  <meta name="theme-color" content="#080d19">
   <title>MediLink | Billing</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap">
   <link rel="stylesheet" href="/app.css">
   <script src="/app.js" defer></script>
 </head>
@@ -14,7 +17,7 @@
       <div class="brand-mark">M</div>
       <p class="eyebrow">MEDILINK · SUBSYSTEM 06</p>
       <h1>Billing &amp; Payments</h1>
-      <p class="muted">Sign in with your billing staff account.</p>
+      <p class="muted">Sign in with your MediLink staff account.</p>
       <label>Username or email<input name="username" autocomplete="username" required></label>
       <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
       <label class="check-label"><input name="showPassword" type="checkbox"> Show password</label>
@@ -24,15 +27,18 @@
   </main>
   <div id="app-view" class="app-shell hidden">
     <aside class="sidebar">
-      <a class="brand" href="#" data-page="dashboard"><span class="brand-mark small">M</span><span>MediLink<small>Billing</small></span></a>
+      <a class="brand" href="#" data-page="billing"><span class="brand-mark small">M</span><span>MediLink<small>Billing</small></span></a>
       <nav id="navigation">
-        <p class="nav-label">WORKSPACE</p>
+        <p class="nav-label">BILLING &amp; PAYMENT</p>
+        <a href="#" data-page="cashier" data-role="billing_admin,cashier">Cashier dashboard</a>
+        <a href="#" data-page="billing">Billing</a>
+        <a href="#" data-page="payments">Payment</a>
+        <a href="#" data-page="history">Patient history</a>
+        <p class="nav-label">MORE</p>
         <a href="#" data-page="dashboard">Overview</a>
-        <a href="#" data-page="accounts">Patient accounts</a>
-        <a href="#" data-page="services">Service catalog</a>
-        <a href="#" data-page="invoices">Invoices</a>
-        <a href="#" data-page="payments">Payments &amp; receipts</a>
         <a href="#" data-page="outstanding">Outstanding</a>
+        <a href="#" data-page="invoices">Itemized invoices</a>
+        <a href="#" data-page="services">Service catalog</a>
         <a href="#" data-page="insurance">Insurance claims</a>
         <a href="#" data-page="refunds">Refunds</a>
         <a href="#" data-page="reports">Reports</a>
@@ -42,7 +48,7 @@
       <div class="sidebar-foot">Independent subsystem<br><span class="muted">Asia/Manila · PHP</span></div>
     </aside>
     <main class="main">
-      <header class="topbar"><button id="menu-button" class="icon-button" aria-label="Toggle navigation">☰</button><span id="breadcrumb">Overview</span><div class="user-area"><span id="user-name"></span><span id="user-role" class="badge"></span><button id="logout" class="button subtle">Sign out</button></div></header>
+      <header class="topbar"><button id="menu-button" class="icon-button" aria-label="Toggle navigation">☰</button><span id="breadcrumb">Billing</span><div class="user-area"><span id="user-name"></span><span id="user-role" class="badge"></span><button id="logout" class="button subtle">Sign out</button></div></header>
       <section id="content" class="content" aria-live="polite"></section>
       <div id="toast" class="toast" role="status"></div>
     </main>

@@ -2,7 +2,17 @@ const API = "/api/v1";
 const $ = (selector, root = document) => root.querySelector(selector);
 const content = $("#content");
 let currentUser = null;
-let currentPage = "dashboard";
+let currentPage = "billing";
+let landed = false;
+let payTargetId = null;
+let pendingBills = new Map();
+let sourceRecords = [];
+const METHOD_LABELS = { cash: "Cash", bank_transfer: "Bank transfer", card_terminal: "Card terminal", e_wallet: "E-wallet", insurance: "Insurance", other: "Other" };
+const PAGE_TITLES = { cashier: "Cashier dashboard", billing: "Billing", payments: "Payment", history: "Patient history", dashboard: "Overview" };
+const canBill = () => ["billing_admin", "billing_officer"].includes(currentUser.role);
+const canPay = () => ["billing_admin", "cashier"].includes(currentUser.role);
+const dateTime = (value) => new Date(value).toLocaleString("en-PH", { timeZone: "Asia/Manila" });
+const centsToInput = (cents) => (cents / 100).toFixed(2);
 
 function money(cents) {
   return new Intl.NumberFormat("en-PH", { style: "currency", currency: "PHP" }).format((cents || 0) / 100);
@@ -31,7 +41,7 @@ function toast(message) {
 function setPage(page) {
   currentPage = page;
   $("#navigation").querySelectorAll("[data-page]").forEach((link) => link.classList.toggle("active", link.dataset.page === page));
-  $("#breadcrumb").textContent = page[0].toUpperCase() + page.slice(1).replace("-", " ");
+  $("#breadcrumb").textContent = PAGE_TITLES[page] || page[0].toUpperCase() + page.slice(1).replace("-", " ");
   $("#navigation").classList.remove("open");
   renderPage().catch(showError);
 }
@@ -56,8 +66,10 @@ function showError(error) {
 
 async function renderPage() {
   content.innerHTML = `<section class="panel">Loading…</section>`;
+  if (currentPage === "cashier") return renderCashier();
+  if (currentPage === "billing") return renderBilling();
+  if (currentPage === "history") return renderHistory();
   if (currentPage === "dashboard") return renderDashboard();
-  if (currentPage === "accounts") return renderAccounts();
   if (currentPage === "services") return renderServices();
   if (currentPage === "invoices") return renderInvoices();
   if (currentPage === "payments") return renderPayments();
@@ -67,6 +79,35 @@ async function renderPage() {
   if (currentPage === "reports") return renderReports();
   if (currentPage === "audit") return renderAudit();
   if (currentPage === "settings") return renderSettings();
+}
+
+async function renderCashier() {
+  const data = await api("/cashier/dashboard");
+  const cards = [
+    ["My collections today", money(data.totals.collectedTodayCents)],
+    ["Receipts I released today", data.totals.receiptsToday],
+    ["Bills waiting for payment", data.totals.waitingBills],
+    ["Amount waiting", money(data.totals.waitingCents)]
+  ];
+  const waitingRows = data.waitingBills.map((item) => `<tr><td>${esc(item.invoiceNumber)}</td><td class="clip" title="${esc(item.department)}">${esc(item.department || "—")}</td><td>${esc(item.patientName)}</td><td>${money(item.balanceCents)}</td><td>${status(item.status)}</td><td>${esc(dateTime(item.createdAt))}</td><td><button class="button primary" data-goto-pay="${esc(item._id)}">Pay</button></td></tr>`).join("");
+  const methodRows = data.methodsToday.map((item) => `<tr><td>${esc(METHOD_LABELS[item.method] || item.method)}</td><td>${item.count}</td><td>${money(item.cents)}</td></tr>`).join("");
+  const paymentRows = data.recentPayments.map((item) => `<tr><td>${esc(item.receiptNumber || "—")}</td><td>${esc(item.invoiceNumber)}</td><td>${esc(item.patientName)}</td><td>${money(item.amountCents)}</td><td>${esc(METHOD_LABELS[item.method] || item.method)}</td><td>${esc(dateTime(item.createdAt))}</td><td>${item.receiptId ? `<button class="button" data-receipt="${esc(item.receiptId)}">Receipt</button>` : ""}</td></tr>`).join("");
+  content.innerHTML = `${pageHead(`Hello, ${esc(currentUser.name || currentUser.username)}`, "Your collections today and the bills waiting at the counter.", `<button class="button primary" data-open-page="payments">Go to Payment</button>`)}<div class="cards">${cards.map(([label, value]) => `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`).join("")}</div><div id="receipt-slot"></div><section class="panel"><h2>Next bills to collect</h2>${table(["Bill no.", "Department", "Patient", "Balance", "Status", "Billed", "Action"], waitingRows, "No bills are waiting for payment.")}${data.totals.waitingBills > data.waitingBills.length ? `<p class="muted">Showing the ${data.waitingBills.length} oldest of ${data.totals.waitingBills} waiting bills. Open the Payment tab for the full list.</p>` : ""}</section><section class="panel"><h2>My collections today, by payment method</h2>${table(["Method", "Payments", "Collected"], methodRows, "You have not processed a payment today.")}</section><section class="panel"><h2>My recent payments</h2>${table(["Receipt", "Bill no.", "Patient", "Amount", "Method", "Date", ""], paymentRows, "You have not processed a payment yet.")}</section>`;
+}
+
+async function renderHistory(search = "") {
+  const data = await api(`/patient-history?search=${encodeURIComponent(search)}`);
+  const rows = data.items.map((item) => `<tr><td>${esc(item.patientName)}</td><td>${esc(item.patientId)}</td><td>${item.billsPaid} of ${item.bills}</td><td>${money(item.paidCents)}</td><td>${money(item.balanceCents)}</td><td>${item.balanceCents > 0 ? status("partially_paid") : status("paid")}</td><td>${item.lastPaymentAt ? esc(dateTime(item.lastPaymentAt)) : "—"}</td><td><button class="button" data-history="${esc(item.patientId)}">View history</button></td></tr>`).join("");
+  content.innerHTML = `${pageHead("Patient history", "Every patient who has paid, with what they paid and what they still owe.")}<form class="toolbar" data-search="history"><input name="search" placeholder="Search patient name or ID…" value="${esc(search)}"><button class="button" type="submit">Search</button>${search ? `<button class="button subtle" type="button" data-open-page="history">Clear</button>` : ""}</form>${table(["Patient", "Patient ID", "Bills fully paid", "Total paid", "Still owed", "Status", "Last payment", ""], rows, search ? "No paying patient matches that search." : "No patient has paid yet. Patients appear here after their first payment.")}`;
+}
+
+async function renderPatientHistory(patientId) {
+  content.innerHTML = `<section class="panel">Loading…</section>`;
+  const data = await api(`/patient-history/${encodeURIComponent(patientId)}`);
+  const cards = [["Total billed", money(data.totals.billedCents)], ["Total paid", money(data.totals.paidCents)], ["Still owed", money(data.totals.balanceCents)], ["Payments made", data.payments.length]];
+  const billRows = data.bills.map((item) => `<tr><td>${esc(item.invoiceNumber)}</td><td class="clip" title="${esc(item.department)}">${esc(item.department || "—")}</td><td class="clip" title="${esc(item.items?.[0]?.description)}">${esc(item.items?.[0]?.description || "—")}</td><td>${money(item.totalCents)}</td><td>${money(item.paidCents)}</td><td>${money(item.balanceCents)}</td><td>${status(item.status)}</td><td>${esc(dateTime(item.createdAt))}</td></tr>`).join("");
+  const paymentRows = data.payments.map((item) => `<tr><td>${esc(item.receiptNumber || "—")}</td><td>${esc(item.invoiceNumber)}</td><td class="clip" title="${esc(item.department)}">${esc(item.department || "—")}</td><td>${money(item.amountCents)}</td><td>${esc(METHOD_LABELS[item.method] || item.method)}</td><td>${esc(dateTime(item.createdAt))}</td><td>${item.receiptId ? `<button class="button" data-receipt="${esc(item.receiptId)}">Receipt</button>` : ""}</td></tr>`).join("");
+  content.innerHTML = `${pageHead(esc(data.patientName), `Patient ID ${esc(data.patientId)} · billing and payment history`, `<button class="button" data-open-page="history">← All patients</button>`)}<div class="cards">${cards.map(([label, value]) => `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`).join("")}</div><div id="receipt-slot"></div><section class="panel"><h2>Payments</h2>${table(["Receipt", "Bill no.", "Department", "Amount", "Method", "Date", ""], paymentRows, "No payments recorded.")}</section><section class="panel"><h2>Bills</h2>${table(["Bill no.", "Department", "For", "Amount", "Paid", "Balance", "Status", "Billed"], billRows, "No bills.")}</section>`;
 }
 
 async function renderDashboard() {
@@ -81,15 +122,7 @@ async function renderDashboard() {
     ["Overdue invoices", data.totals.overdueInvoices]
   ];
   const paymentRows = data.recentPayments.map((item) => `<tr><td>${esc(item.paymentReference)}</td><td>${esc(item.invoiceNumber)}</td><td>${esc(item.patientName)}</td><td>${esc(new Date(item.createdAt).toLocaleString("en-PH", { timeZone: "Asia/Manila" }))}</td><td>${esc(item.method)}</td><td>${money(item.amountCents)}</td></tr>`).join("");
-  content.innerHTML = `${pageHead("Financial overview", "Live billing activity and current account totals.")}<div class="cards">${values.map(([label, value]) => `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`).join("")}</div><section class="panel"><h2>Recent payments</h2>${table(["Payment ref", "Invoice", "Patient", "Date", "Method", "Amount"], paymentRows)}</section>`;
-}
-
-async function renderAccounts(search = "") {
-  const [data, invoices] = await Promise.all([api(`/accounts?search=${encodeURIComponent(search)}`), api("/outstanding")]);
-  const balanceMap = new Map();
-  for (const invoice of invoices.items) balanceMap.set(invoice.patientId, (balanceMap.get(invoice.patientId) || 0) + invoice.balanceCents);
-  const rows = data.items.map((item) => `<tr><td>${esc(item.patientId)}</td><td>${esc(item.patientName)}</td><td>${esc(item.billingAccountNumber)}</td><td>${esc(item.contact)}</td><td>${money(balanceMap.get(item.patientId) || 0)}</td></tr>`).join("");
-  content.innerHTML = `${pageHead("Patient billing accounts", "Billing references for patients; patient identity remains owned by the MediLink patient system.", currentUser.role === "billing_admin" || currentUser.role === "billing_officer" ? `<button class="button primary" data-scroll="account-form">Register account</button>` : "")}<div class="toolbar"><input id="account-search" placeholder="Search patient, ID, account…" value="${esc(search)}"><button class="button" id="account-search-btn">Search</button></div>${table(["Patient ID", "Patient", "Account number", "Contact", "Open balance"], rows)}${currentUser.role === "billing_admin" || currentUser.role === "billing_officer" ? formPanel("Register billing account", `${input("patientId", "Patient ID")}${input("patientName", "Patient name")}${input("billingAccountNumber", "Billing account number")}${input("contact", "Contact", "text", false)}<label class="wide">Billing address<textarea name="billingAddress"></textarea></label>`, "Create account", "account") : ""}`;
+  content.innerHTML = `${pageHead("Financial overview", "Live billing activity and current totals.")}<div class="cards">${values.map(([label, value]) => `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`).join("")}</div><section class="panel"><h2>Recent payments</h2>${table(["Payment ref", "Invoice", "Patient", "Date", "Method", "Amount"], paymentRows)}</section>`;
 }
 
 async function renderServices() {
@@ -99,23 +132,78 @@ async function renderServices() {
 }
 
 async function renderInvoices() {
-  const [data, accounts, services] = await Promise.all([api("/invoices"), api("/accounts"), api("/services")]);
+  const [data, patients, services] = await Promise.all([api("/invoices"), api("/patients"), api("/services")]);
   const rows = data.items.map((item) => `<tr><td>${esc(item.invoiceNumber || "Draft")}</td><td>${esc(item.patientName)}</td><td>${new Date(item.createdAt).toLocaleDateString("en-PH")}</td><td>${money(item.totalCents)}</td><td>${money(item.balanceCents)}</td><td>${status(item.status)}</td><td>${item.status === "draft" && ["billing_admin", "billing_officer"].includes(currentUser.role) ? `<button class="button" data-issue="${esc(item._id)}">Issue</button>` : item.status === "issued" && currentUser.role === "billing_admin" ? `<button class="button danger" data-cancel="${esc(item._id)}">Cancel</button>` : ""}</td></tr>`).join("");
-  const accountOptions = accounts.items.map((item) => `<option value="${esc(item._id)}">${esc(item.patientId)} · ${esc(item.patientName)}</option>`).join("");
+  const patientOptions = patients.items.map((item) => `<option value="${esc(item.patientId)}">${esc(item.patientName)} · ${esc(item.patientId)}</option>`).join("");
   const serviceOptions = services.items.map((item) => `<option value="${esc(item._id)}">${esc(item.code)} · ${esc(item.name)} (${money(item.unitPriceCents)})</option>`).join("");
-  const creator = ["billing_admin", "billing_officer"].includes(currentUser.role) ? formPanel("Create draft invoice", `<label class="wide">Patient account<select name="patientAccountId" required>${accountOptions}</select></label><label class="wide">Service<select name="serviceId" required>${serviceOptions}</select></label>${input("quantity", "Quantity", "number", true, 'min="1" value="1"')}<label class="wide">Notes<textarea name="notes"></textarea></label>`, "Save draft", "invoice") : "";
+  const creator = ["billing_admin", "billing_officer"].includes(currentUser.role) ? formPanel("Create draft invoice", `<label class="wide">Patient<select name="patientId" required>${patientOptions}</select></label><label class="wide">Service<select name="serviceId" required>${serviceOptions}</select></label>${input("quantity", "Quantity", "number", true, 'min="1" value="1"')}<label class="wide">Notes<textarea name="notes"></textarea></label>`, "Save draft", "invoice") : "";
   content.innerHTML = `${pageHead("Invoices", "Draft, issue, and track patient invoices.")}${table(["Invoice", "Patient", "Created", "Total", "Balance", "Status", "Actions"], rows)}${creator}`;
 }
 
-async function renderPayments() {
-  const [data, invoices, receipts] = await Promise.all([api("/payments"), api("/invoices"), api("/receipts")]);
+async function renderBilling() {
+  const [departments, patients, data] = await Promise.all([api("/departments"), api("/patients"), api("/invoices?limit=50")]);
+  sourceRecords = [];
+  const departmentOptions = departments.items.map((item) => `<option value="${esc(item.id)}">${esc(item.name)}</option>`).join("");
+  const patientOptions = patients.items.map((item) => `<option value="${esc(item.patientId)}">${esc(item.patientName)} · ${esc(item.patientId)}</option>`).join("");
   const rows = data.items.map((item) => {
-    const receipt = receipts.items.find((row) => String(row.paymentId) === String(item._id));
-    return `<tr><td>${esc(item.paymentReference)}</td><td>${esc(receipt?.receiptNumber || "—")} ${receipt ? `<button class="button" data-print="${esc(receipt._id)}">Print</button>` : ""}</td><td>${esc(item.invoiceNumber)}</td><td>${esc(item.patientName)}</td><td>${money(item.amountCents)}</td><td>${esc(item.method)}</td><td>${new Date(item.createdAt).toLocaleString("en-PH", { timeZone: "Asia/Manila" })}</td></tr>`;
+    const open = ["issued", "partially_paid", "overdue"].includes(item.status) && item.balanceCents > 0;
+    const actions = `${open && canPay() ? `<button class="button primary" data-goto-pay="${esc(item._id)}">Pay</button>` : ""}${["issued", "overdue"].includes(item.status) && item.paidCents === 0 && currentUser.role === "billing_admin" ? ` <button class="button danger" data-cancel="${esc(item._id)}">Cancel</button>` : ""}`;
+    return `<tr><td>${esc(item.invoiceNumber || "Draft")}</td><td class="clip" title="${esc(item.department)}">${esc(item.department || "—")}</td><td>${esc(item.patientName)}</td><td>${esc(item.sourceReference || "—")}</td><td>${money(item.totalCents)}</td><td>${money(item.balanceCents)}</td><td>${status(item.status)}</td><td>${esc(dateTime(item.createdAt))}</td><td>${actions}</td></tr>`;
   }).join("");
-  const options = invoices.items.filter((item) => ["issued", "partially_paid", "overdue"].includes(item.status)).map((item) => `<option value="${esc(item._id)}">${esc(item.invoiceNumber)} · ${esc(item.patientName)} · ${money(item.balanceCents)} due</option>`).join("");
-  const form = ["billing_admin", "cashier"].includes(currentUser.role) ? formPanel("Record payment", `<label class="wide">Invoice<select name="invoiceId" required>${options}</select></label>${input("amount", "Amount (PHP)", "number", true, 'min="0.01" step="0.01"')}<label>Payment method<select name="method"><option value="cash">Cash</option><option value="bank_transfer">Bank transfer</option><option value="card_terminal">External card terminal</option><option value="e_wallet">E-wallet</option><option value="insurance">Insurance</option><option value="other">Other</option></select></label>${input("transactionReference", "Transaction reference", "text", false)}<p class="wide muted">Do not enter card numbers, CVV, PIN, or passwords. Card payments must be completed through an external terminal/provider.</p>`, "Record & issue receipt", "payment") : "";
-  content.innerHTML = `${pageHead("Payments & receipts", "Successful payments automatically receive one immutable receipt.")}${table(["Payment", "Receipt", "Invoice", "Patient", "Amount", "Method", "Date"], rows)}${form}`;
+  const form = canBill() ? formPanel("New bill", `<label>Department<select name="department" required><option value="" disabled selected>Choose a department…</option>${departmentOptions}</select></label><label>Patient<select name="patientId" required><option value="" disabled selected>Choose a patient…</option>${patientOptions}</select></label><label class="wide">Record from the department (optional)<select name="sourceIndex" disabled><option value="">Choose a department and a patient first</option></select></label>${input("amount", "Bill amount (PHP)", "number", true, 'min="0.01" step="0.01" placeholder="0.00"')}<label>Description (optional)<input name="description" maxlength="300" placeholder="e.g. CBC and urinalysis"></label>`, "Create bill & send to Payment", "bill") : `<section class="panel muted">Your role can view bills but cannot create them.</section>`;
+  content.innerHTML = `${pageHead("Billing", "Choose the department and patient, then enter the bill amount. Every bill goes straight to the Payment tab.")}${form}<section class="panel"><h2>Recent bills</h2>${table(["Bill no.", "Department", "Patient", "Source record", "Amount", "Balance", "Status", "Created", "Action"], rows, "No bills yet.")}</section>`;
+}
+
+// Loads what the chosen department has on file for the chosen patient.
+async function loadSourceRecords(form) {
+  const select = form.elements.sourceIndex;
+  const department = form.elements.department.value;
+  const patientId = form.elements.patientId.value;
+  sourceRecords = [];
+  if (!department || !patientId) return;
+  select.disabled = true;
+  select.innerHTML = `<option value="">Loading records…</option>`;
+  try {
+    const data = await api(`/source-records?department=${encodeURIComponent(department)}&patientId=${encodeURIComponent(patientId)}`);
+    // Ignore the answer if the choice changed while it was loading.
+    if (form.elements.department.value !== department || form.elements.patientId.value !== patientId) return;
+    sourceRecords = data.items;
+    select.innerHTML = sourceRecords.length
+      ? `<option value="">No record — enter the bill manually</option>${sourceRecords.map((item, index) => `<option value="${index}">${esc(item.label)}${item.status ? ` (${esc(item.status)})` : ""}${item.amountCents ? ` · ${money(item.amountCents)}` : ""}${item.billed ? " · already billed" : ""}</option>`).join("")}`
+      : `<option value="">This department has no records for this patient</option>`;
+    select.disabled = !sourceRecords.length;
+  } catch (error) {
+    select.innerHTML = `<option value="">Records could not be loaded</option>`;
+    toast(error.message);
+  }
+}
+
+function receiptHtml(receipt) {
+  const patient = receipt.patientId && receipt.patientId !== "N/A" ? `${receipt.patientName} (${receipt.patientId})` : receipt.patientName;
+  const fields = [
+    ["Receipt no.", receipt.receiptNumber], ["Date", dateTime(receipt.createdAt)], ["Patient", patient],
+    ["Department", receipt.department || "—"], ["Bill no.", receipt.invoiceNumber],
+    ["Payment method", METHOD_LABELS[receipt.method] || receipt.method], ["Reference", receipt.transactionReference || "—"],
+    ["Balance remaining", money(receipt.balanceAfterCents)]
+  ];
+  return `<section class="receipt" id="receipt"><header><h2>${esc(receipt.hospitalName)}</h2>${receipt.hospitalAddress ? `<p>${esc(receipt.hospitalAddress)}</p>` : ""}${receipt.hospitalContact ? `<p>${esc(receipt.hospitalContact)}</p>` : ""}<h3>Official payment receipt</h3></header>${fields.map(([label, value]) => `<div class="receipt-row"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("")}<div class="receipt-row receipt-total"><span>Amount paid</span><strong>${money(receipt.amountCents)}</strong></div><div class="receipt-actions no-print"><button class="button primary" type="button" data-print-receipt>Print receipt</button><button class="button" type="button" data-close-receipt>Close</button></div></section>`;
+}
+
+async function renderPayments({ receipt = null } = {}) {
+  const [pending, data, receipts] = await Promise.all([api("/outstanding"), api("/payments"), api("/receipts")]);
+  pendingBills = new Map(pending.items.map((item) => [String(item._id), item]));
+  const selected = pendingBills.has(payTargetId) ? payTargetId : "";
+  payTargetId = null;
+  const pendingRows = pending.items.map((item) => `<tr><td>${esc(item.invoiceNumber)}</td><td class="clip" title="${esc(item.department)}">${esc(item.department || "—")}</td><td>${esc(item.patientName)}</td><td>${money(item.totalCents)}</td><td>${money(item.paidCents)}</td><td>${money(item.balanceCents)}</td><td>${status(item.status)}</td><td>${canPay() ? `<button class="button primary" data-pay="${esc(item._id)}">Pay</button>` : ""}</td></tr>`).join("");
+  const options = pending.items.map((item) => `<option value="${esc(item._id)}" ${String(item._id) === selected ? "selected" : ""}>${esc(item.invoiceNumber)} · ${esc(item.patientName)} · ${esc(item.department || "No department")} · ${money(item.balanceCents)} due</option>`).join("");
+  const form = canPay() ? formPanel("Process payment", `<label class="wide">Bill<select name="invoiceId" required><option value="" disabled ${selected ? "" : "selected"}>Choose a bill to pay…</option>${options}</select></label>${input("amount", "Amount to pay (PHP)", "number", true, `min="0.01" step="0.01" placeholder="0.00" ${selected ? `value="${centsToInput(pendingBills.get(selected).balanceCents)}"` : ""}`)}<label>Payment method<select name="method">${Object.entries(METHOD_LABELS).map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}</select></label>${input("transactionReference", "Transaction reference (optional)", "text", false, 'maxlength="120"')}<p class="wide muted">Do not enter card numbers, CVV, PIN, or passwords. Card payments must be completed through an external terminal/provider.</p>`, "Process payment & release receipt", "payment") : `<section class="panel muted">Your role can view payments but cannot process them.</section>`;
+  const rows = data.items.map((item) => {
+    const match = receipts.items.find((row) => String(row.paymentId) === String(item._id));
+    return `<tr><td>${esc(match?.receiptNumber || "—")}</td><td>${esc(item.invoiceNumber)}</td><td class="clip" title="${esc(item.department)}">${esc(item.department || "—")}</td><td>${esc(item.patientName)}</td><td>${money(item.amountCents)}</td><td>${esc(METHOD_LABELS[item.method] || item.method)}</td><td>${esc(dateTime(item.createdAt))}</td><td>${match ? `<button class="button" data-receipt="${esc(match._id)}">Receipt</button>` : ""}</td></tr>`;
+  }).join("");
+  content.innerHTML = `${pageHead("Payment", "Bills from every department arrive here. Process the payment and a receipt is released.")}<div id="receipt-slot">${receipt ? receiptHtml(receipt) : ""}</div><section class="panel"><h2>Bills waiting for payment</h2>${table(["Bill no.", "Department", "Patient", "Total", "Paid", "Balance", "Status", "Action"], pendingRows, "No bills are waiting for payment.")}</section><div id="payment-form">${form}</div><section class="panel"><h2>Payment history</h2>${table(["Receipt", "Bill no.", "Department", "Patient", "Amount", "Method", "Date", ""], rows, "No payments yet.")}</section>`;
+  if (receipt) $("#receipt")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  else if (selected) $("#payment-form").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 async function renderOutstanding() {
@@ -149,10 +237,10 @@ async function renderReports() {
   content.innerHTML = `${pageHead("Financial reports", "Summary uses recorded payments and non-cancelled invoices.", `<a class="button" href="${API}/reports/payments.csv">Export payments CSV</a>`)}<div class="cards"><div class="card"><div class="label">Collected</div><div class="value">${money(data.collectedCents)}</div></div><div class="card"><div class="label">Payments</div><div class="value">${data.paymentCount}</div></div><div class="card"><div class="label">Approved refunds</div><div class="value">${money(data.refundedCents)}</div></div></div><section class="panel"><h2>Invoice summary</h2>${table(["Status", "Count", "Total"], invoiceRows)}</section><section class="panel"><h2>Payment method summary</h2>${table(["Method", "Count", "Collected"], methodRows)}</section>`;
 }
 
-async function renderAudit() {
-  const data = await api("/audit-logs");
-  const rows = data.items.map((item) => `<tr><td>${new Date(item.createdAt).toLocaleString("en-PH", { timeZone: "Asia/Manila" })}</td><td>${esc(item.username)}</td><td>${esc(item.action)}</td><td>${esc(item.recordType)}</td><td>${esc(item.recordId)}</td></tr>`).join("");
-  content.innerHTML = `${pageHead("Audit activity", "Immutable application audit records.")}${table(["Timestamp", "User", "Action", "Record type", "Record ID"], rows)}`;
+async function renderAudit(billingOnly = false) {
+  const data = await api(`/audit-logs${billingOnly ? "?module=billing" : ""}`);
+  const rows = data.items.map((item) => `<tr><td>${item.createdAt ? esc(dateTime(item.createdAt)) : "—"}</td><td>${esc(item.userName)}</td><td>${esc(item.role)}</td><td>${esc(item.module)}</td><td>${esc(item.action)}</td><td class="clip wide-clip" title="${esc(item.details)}">${esc(item.details)}</td></tr>`).join("");
+  content.innerHTML = `${pageHead("Audit activity", "Activity from the shared MediLink audit log, across every subsystem.")}<div class="toolbar"><button class="button ${billingOnly ? "" : "primary"}" data-audit="all">All subsystems</button><button class="button ${billingOnly ? "primary" : ""}" data-audit="billing">Billing only</button></div>${table(["Timestamp", "User", "Role", "Module", "Action", "Details"], rows)}`;
 }
 
 async function renderSettings() {
@@ -181,7 +269,7 @@ $("#login-form").addEventListener("submit", async (event) => {
 $("#login-form [name=showPassword]").addEventListener("change", (event) => {
   $("#login-form [name=password]").type = event.target.checked ? "text" : "password";
 });
-$("#logout").addEventListener("click", async () => { await api("/auth/logout", { method: "POST" }); currentUser = null; showLogin(); });
+$("#logout").addEventListener("click", async () => { await api("/auth/logout", { method: "POST" }); currentUser = null; landed = false; showLogin(); });
 $("#menu-button").addEventListener("click", () => $(".sidebar").classList.toggle("open"));
 $("#navigation").addEventListener("click", (event) => {
   const link = event.target.closest("[data-page]");
@@ -193,38 +281,65 @@ content.addEventListener("click", async (event) => {
   const issue = event.target.closest("[data-issue]");
   const cancel = event.target.closest("[data-cancel]");
   const approve = event.target.closest("[data-refund]");
-  const print = event.target.closest("[data-print]");
+  const print = event.target.closest("[data-receipt]");
   if (issue) {
-    try { await api(`/invoices/${issue.dataset.issue}/issue`, { method: "POST", body: "{}" }); toast("Invoice issued."); await renderInvoices(); } catch (error) { toast(error.message); }
+    try { await api(`/invoices/${issue.dataset.issue}/issue`, { method: "POST", body: "{}" }); toast("Invoice issued."); await renderPage(); } catch (error) { toast(error.message); }
   }
   if (cancel) {
     const reason = prompt("Reason for cancellation (minimum 5 characters):");
     if (!reason) return;
-    try { await api(`/invoices/${cancel.dataset.cancel}/cancel`, { method: "POST", body: JSON.stringify({ reason }) }); toast("Invoice cancelled."); await renderInvoices(); } catch (error) { toast(error.message); }
+    try { await api(`/invoices/${cancel.dataset.cancel}/cancel`, { method: "POST", body: JSON.stringify({ reason }) }); toast("Bill cancelled."); await renderPage(); } catch (error) { toast(error.message); }
   }
   if (approve) {
     try { await api(`/refunds/${approve.dataset.refund}/approve`, { method: "POST", body: "{}" }); toast("Refund approved."); await renderRefunds(); } catch (error) { toast(error.message); }
   }
   if (print) {
     try {
-      const receipt = await api(`/receipts/${print.dataset.print}`);
-      const receiptWindow = window.open("", "_blank", "width=640,height=720");
-      if (!receiptWindow) throw new Error("Allow pop-ups to print the receipt.");
-      receiptWindow.opener = null;
-      const fields = [
-        ["Receipt", receipt.receiptNumber], ["Payment date", new Date(receipt.createdAt).toLocaleString("en-PH", { timeZone: "Asia/Manila" })],
-        ["Patient", `${receipt.patientName} (${receipt.patientId})`], ["Invoice", receipt.invoiceNumber],
-        ["Amount", money(receipt.amountCents)], ["Method", receipt.method], ["Reference", receipt.transactionReference || "—"],
-        ["Balance remaining", money(receipt.balanceAfterCents)]
-      ];
-      receiptWindow.document.write(`<!doctype html><html><head><title>Receipt ${esc(receipt.receiptNumber)}</title><style>body{font:15px Arial,sans-serif;max-width:560px;margin:40px auto;color:#222}header{text-align:center;border-bottom:1px solid #bbb;padding-bottom:16px}h1{font-size:21px}p{margin:5px}.row{display:flex;justify-content:space-between;border-bottom:1px solid #ddd;padding:9px 0}.amount{font-size:20px;font-weight:bold}@media print{button{display:none}}</style></head><body><header><h1>${esc(receipt.hospitalName)}</h1><p>${esc(receipt.hospitalAddress)}</p><p>${esc(receipt.hospitalContact)}</p><h2>Official payment receipt</h2></header>${fields.map(([label, value]) => `<div class="row"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("")}<p class="muted">Reprint of the original receipt. No new payment was created.</p><button onclick="window.print()">Print</button></body></html>`);
-      receiptWindow.document.close();
+      $("#receipt-slot").innerHTML = receiptHtml(await api(`/receipts/${print.dataset.receipt}`));
+      $("#receipt").scrollIntoView({ behavior: "smooth", block: "start" });
     } catch (error) { toast(error.message); }
   }
-  if (event.target.closest("[data-scroll]")) $(`#${event.target.closest("[data-scroll]").dataset.scroll}`)?.scrollIntoView({ behavior: "smooth" });
-  if (event.target.id === "account-search-btn") renderAccounts($("#account-search").value).catch(showError);
+  if (event.target.closest("[data-print-receipt]")) window.print();
+  if (event.target.closest("[data-close-receipt]")) $("#receipt-slot").innerHTML = "";
+  const pay = event.target.closest("[data-pay]");
+  if (pay) {
+    const form = $("#payment-form form");
+    form.elements.invoiceId.value = pay.dataset.pay;
+    form.elements.amount.value = centsToInput(pendingBills.get(pay.dataset.pay).balanceCents);
+    $("#payment-form").scrollIntoView({ behavior: "smooth", block: "start" });
+    form.elements.amount.focus({ preventScroll: true });
+  }
+  const history = event.target.closest("[data-history]");
+  if (history) renderPatientHistory(history.dataset.history).catch(showError);
+  const openPage = event.target.closest("[data-open-page]");
+  if (openPage) setPage(openPage.dataset.openPage);
+  const gotoPay = event.target.closest("[data-goto-pay]");
+  if (gotoPay) { payTargetId = gotoPay.dataset.gotoPay; setPage("payments"); }
+  const auditFilter = event.target.closest("[data-audit]");
+  if (auditFilter) renderAudit(auditFilter.dataset.audit === "billing").catch(showError);
+});
+content.addEventListener("change", (event) => {
+  const form = event.target.closest("form[data-action]");
+  if (!form) return;
+  const name = event.target.name;
+  if (form.dataset.action === "payment" && name === "invoiceId") {
+    const bill = pendingBills.get(event.target.value);
+    if (bill) form.elements.amount.value = centsToInput(bill.balanceCents);
+  }
+  if (form.dataset.action === "bill" && (name === "department" || name === "patientId")) loadSourceRecords(form);
+  if (form.dataset.action === "bill" && name === "sourceIndex") {
+    const record = event.target.value === "" ? null : sourceRecords[Number(event.target.value)];
+    if (!record) return;
+    form.elements.description.value = record.label.slice(0, 300);
+    if (record.amountCents) form.elements.amount.value = centsToInput(record.amountCents);
+  }
 });
 content.addEventListener("submit", async (event) => {
+  const searchForm = event.target.closest("form[data-search]");
+  if (searchForm) {
+    event.preventDefault();
+    return renderHistory(new FormData(searchForm).get("search").trim()).catch(showError);
+  }
   const form = event.target.closest("form[data-action]");
   if (!form) return;
   event.preventDefault();
@@ -232,16 +347,25 @@ content.addEventListener("submit", async (event) => {
   try {
     const action = form.dataset.action;
     let path; let method = "POST"; let body;
-    if (action === "account") { path = "/accounts"; body = Object.fromEntries(data); }
     if (action === "service") { path = "/services"; body = { code: data.get("code"), name: data.get("name"), category: data.get("category"), description: data.get("description"), unitPriceCents: moneyToCents(data.get("unitPrice")) }; }
-    if (action === "invoice") { path = "/invoices"; body = { patientAccountId: data.get("patientAccountId"), items: [{ serviceId: data.get("serviceId"), quantity: Number(data.get("quantity")) }], notes: data.get("notes") }; }
+    if (action === "invoice") { path = "/invoices"; body = { patientId: data.get("patientId"), items: [{ serviceId: data.get("serviceId"), quantity: Number(data.get("quantity")) }], notes: data.get("notes") }; }
+    if (action === "bill") {
+      const source = sourceRecords[Number(data.get("sourceIndex"))] && data.get("sourceIndex") !== "" ? sourceRecords[Number(data.get("sourceIndex"))] : null;
+      const bill = await api("/bills", { method, body: JSON.stringify({ department: Number(data.get("department")), patientId: data.get("patientId"), amountCents: moneyToCents(data.get("amount")), description: data.get("description") || undefined, sourceReference: source?.reference || undefined }) });
+      toast(`Bill ${bill.invoiceNumber} sent to Payment.`);
+      return renderBilling();
+    }
     if (action === "payment") {
-      path = "/payments";
       body = { invoiceId: data.get("invoiceId"), amountCents: moneyToCents(data.get("amount")), method: data.get("method"), transactionReference: data.get("transactionReference") };
-      const key = crypto.randomUUID();
-      await api(path, { method, headers: { "Idempotency-Key": key }, body: JSON.stringify(body) });
-      toast("Payment recorded and receipt issued.");
-      return renderPayments();
+      // One key per rendered form, so a double submit cannot record the payment twice.
+      form.dataset.key ||= crypto.randomUUID();
+      const button = form.querySelector("button[type=submit]");
+      button.disabled = true;
+      try {
+        const result = await api("/payments", { method, headers: { "Idempotency-Key": form.dataset.key }, body: JSON.stringify(body) });
+        toast(result.duplicate ? "This payment was already recorded." : "Payment processed and receipt released.");
+        return await renderPayments({ receipt: result.receipt });
+      } finally { button.disabled = false; }
     }
     if (action === "claim") { path = "/insurance/claims"; body = { providerId: data.get("providerId"), invoiceId: data.get("invoiceId"), claimCents: moneyToCents(data.get("claimAmount")), claimReference: data.get("claimReference") }; }
     if (action === "provider") { path = "/insurance/providers"; body = Object.fromEntries(data); }
@@ -265,11 +389,14 @@ async function checkSession() {
   currentUser = data.user;
   $("#login-view").classList.add("hidden");
   $("#app-view").classList.remove("hidden");
-  $("#user-name").textContent = currentUser.username;
+  $("#user-name").textContent = currentUser.name || currentUser.username;
   $("#user-role").textContent = currentUser.role.replaceAll("_", " ");
   $("#navigation").querySelectorAll("[data-role]").forEach((link) => {
     link.classList.toggle("hidden", !link.dataset.role.split(",").includes(currentUser.role));
   });
+  // Cashiers start on their own dashboard; everyone else starts on Billing.
+  if (!landed) currentPage = currentUser.role === "cashier" ? "cashier" : "billing";
+  landed = true;
   setPage(currentPage);
 }
 checkSession().catch(showLogin);

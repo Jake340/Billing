@@ -10,7 +10,7 @@ Independent Subsystem 6 starter application using Node.js, Express, MongoDB Atla
 ## Local setup
 
 1. Run `npm run setup` to create `.env` with a generated session secret, or copy `.env.example` manually.
-2. Set `MONGODB_URI` in `.env` to your rotated MongoDB Atlas URI. Set `DB_NAME=medilink_billing_dev` (or another billing-only database name). The app explicitly selects `DB_NAME` for both Mongoose and session storage, even if the URI path names a different database.
+2. Set `MONGODB_URI` in `.env` to the MediLink MongoDB Atlas URI and keep `DB_NAME=medilink_lab_dev`. Billing shares that database with the other subsystems so it can read their records; its own collections all start with `billing_` and are only created when first needed.
 3. Install packages with `npm install`.
 4. On Windows, create the initial administrator using the hidden-password PowerShell prompt:
 
@@ -22,13 +22,15 @@ Independent Subsystem 6 starter application using Node.js, Express, MongoDB Atla
 
 5. Start with `npm start`, then open `http://localhost:3000`.
 
-The app never creates or assumes an unrelated shared MediLink database. Point `MONGODB_URI` only to a billing database approved for this subsystem. Keep `.env` out of source control.
-Create a MongoDB database user with only the permissions needed for the Billing database. Never reuse a Laboratory-only database user or copy its password into `.env.example`.
+Billing only reads the other subsystems' collections (`portal_subsystems`, `patients`, `laboratory_requests`, `admit_admissions`, `medicationOrders`, `ipd_room_rates`); it never writes to them. Two shared collections are used directly instead of billing copies: staff sign in from `users` (roles `billing_admin`, `billing_officer`, `cashier`, `billing_auditor`, or a portal `Administrator` with `subsystems: ["ALL"]`; Argon2 and bcrypt hashes are both accepted), and all activity is written to `auditlogs` with `module: "Billing"`. Keep `.env` out of source control.
 
 ## Implemented functionality
 
+- **Billing tab:** choose a department (the other subsystems, read live from the portal), choose a patient from the shared registry, optionally pick one of that department's records for the patient, and type the bill amount. The bill is issued immediately.
+- **Patient history tab:** every patient who has paid, with totals and a per-patient view of their bills, payments and receipts.
+- **Payment tab:** every bill waits here; processing a payment (full or partial) releases a printable receipt.
 - Argon2id login, secure HTTP-only sessions stored in MongoDB, login throttling, role enforcement, and audit records for login/logout.
-- Patient billing account registration/search, service catalog, draft/issue/cancel invoice workflows, historical line-item prices, integer-centavo amounts, and due-date aging.
+- Patients are read from the Patient Registration subsystem (Billing never creates patients or patient accounts). Service catalog, draft/issue/cancel invoice workflows, historical line-item prices, integer-centavo amounts, and due-date aging.
 - Partial/full payment recording, idempotency-key duplicate prevention, transactionally updated invoice balances, unique payment/receipt sequences, and non-sensitive receipt metadata.
 - Insurance providers and claims, pending/approved refunds, outstanding balances, dashboard aggregates, payment/invoice summaries, CSV export, settings, and audit-log viewing.
 - Responsive dark browser UI connected to the API.
@@ -36,7 +38,7 @@ Create a MongoDB database user with only the permissions needed for the Billing 
 
 ## API
 
-All APIs are under `/api/v1`; the frontend is served by Express. Important routes include `/auth/login`, `/auth/session`, `/dashboard`, `/accounts`, `/services`, `/invoices`, `/payments`, `/receipts`, `/outstanding`, `/insurance/providers`, `/insurance/claims`, `/refunds`, `/reports/summary`, `/reports/payments.csv`, `/settings`, and `/audit-logs`.
+All APIs are under `/api/v1`; the frontend is served by Express. Important routes include `/auth/login`, `/auth/session`, `/dashboard`, `/departments`, `/patients`, `/source-records`, `/bills`, `/services`, `/invoices`, `/payments`, `/receipts`, `/outstanding`, `/insurance/providers`, `/insurance/claims`, `/refunds`, `/reports/summary`, `/reports/payments.csv`, `/settings`, and `/audit-logs`.
 
 Amounts sent to payment APIs are integer centavos. Tax is calculated in integer centavos from the configured basis-point setting; leave it at zero until an authorized, verified policy is configured. The payment endpoint requires a unique `Idempotency-Key` request header. Card credentials are never accepted; `card_terminal` records an external terminal reference only.
 

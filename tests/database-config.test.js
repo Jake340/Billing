@@ -2,24 +2,22 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { getDatabaseName } = require("../src/config/database");
 
-test("billing database defaults to an isolated database", () => {
+function withDbName(value, run) {
   const previous = process.env.DB_NAME;
-  delete process.env.DB_NAME;
+  if (value === undefined) delete process.env.DB_NAME;
+  else process.env.DB_NAME = value;
   try {
-    assert.equal(getDatabaseName(), "medilink_billing_dev");
+    run();
   } finally {
     if (previous === undefined) delete process.env.DB_NAME;
     else process.env.DB_NAME = previous;
   }
+}
+
+test("billing defaults to the shared MediLink database", () => {
+  withDbName(undefined, () => assert.equal(getDatabaseName(), "medilink_lab_dev"));
 });
 
-test("billing database cannot target the Laboratory database", () => {
-  const previous = process.env.DB_NAME;
-  process.env.DB_NAME = "medilink_lab_dev";
-  try {
-    assert.throws(() => getDatabaseName(), /cannot use the Laboratory database/);
-  } finally {
-    if (previous === undefined) delete process.env.DB_NAME;
-    else process.env.DB_NAME = previous;
-  }
+test("DB_NAME overrides the database name", () => {
+  withDbName("some_other_db", () => assert.equal(getDatabaseName(), "some_other_db"));
 });

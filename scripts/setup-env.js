@@ -19,4 +19,4 @@ const localEnv = template.replace(
 fs.writeFileSync(envPath, localEnv, { flag: "wx", mode: 0o600 });
 console.log("Created .env with a new local session secret.");
 console.log("Now edit .env and set MONGODB_URI to your rotated MongoDB credential.");
-console.log("DB_NAME is set to medilink_billing_dev so Billing does not connect to the Laboratory database.");
+console.log("DB_NAME must be the shared MediLink database (medilink_lab_dev) so Billing can read the other subsystems.");
